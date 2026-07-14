@@ -1,6 +1,8 @@
 #pragma comment(lib, "windowsapp")
 
+#include <algorithm>
 #include <chrono>
+#include <stdexcept>
 
 // This must be included before many other Windows headers.
 #include <windows.h>
@@ -18,8 +20,11 @@
 #include <winrt/Windows.Media.Core.h>
 #include <winrt/Windows.Media.Playback.h>
 #include <winrt/Windows.System.h>
-#define TO_MILLISECONDS(timespan) timespan.count() / 10000
-#define TO_MICROSECONDS(timespan) TO_MILLISECONDS(timespan) * 1000
+#define TO_MILLISECONDS(timespan) ((timespan).count() / 10000)
+// A WinRT TimeSpan is measured in 100-nanosecond ticks, so 1 microsecond is
+// 10 ticks. Divide by 10 directly rather than going through TO_MILLISECONDS,
+// which would truncate to millisecond granularity first.
+#define TO_MICROSECONDS(timespan) ((timespan).count() / 10)
 
 using flutter::EncodableMap;
 using flutter::EncodableValue;
@@ -258,21 +263,29 @@ public:
 
     if (method_call.method_name().compare("load") == 0) {
       const auto* audioSourceData = std::get_if<flutter::EncodableMap>(ValueOrNull(*args, "audioSource"));
-      const auto* initialPosition = std::get_if<int>(ValueOrNull(*args, "initialPosition"));
+      if (audioSourceData == nullptr) {
+        return result->Error("load_error", "audioSource argument missing");
+      }
       const auto* initialIndex = std::get_if<int>(ValueOrNull(*args, "initialIndex"));
+      // Read as an EncodableValue and use LongValue(): a position in
+      // microseconds exceeds INT32_MAX past ~35 minutes, at which point the
+      // Flutter codec encodes it as an int64 and std::get_if<int> would fail.
+      const auto* initialPosition = ValueOrNull(*args, "initialPosition");
 
       try {
         loadSource(*audioSourceData);
-      } catch (char* error) {
-        return result->Error("load_error", error);
+      } catch (const winrt::hresult_error& error) {
+        return result->Error("load_error", winrt::to_string(error.message()));
+      } catch (const std::exception& error) {
+        return result->Error("load_error", error.what());
       }
 
       if (initialIndex != nullptr) {
         seekToItem((uint32_t)*initialIndex);
       }
 
-      if (initialPosition != nullptr) {
-        seekToPosition(*initialPosition);
+      if (initialPosition != nullptr && !initialPosition->IsNull()) {
+        seekToPosition(initialPosition->LongValue());
       }
 
       result->Success(flutter::EncodableMap());
@@ -355,6 +368,9 @@ public:
       result->Success(flutter::EncodableMap());
     } else if (method_call.method_name().compare("setShuffleOrder") == 0) {
       const auto* source = std::get_if<flutter::EncodableMap>(ValueOrNull(*args, "audioSource"));
+      if (source == nullptr) {
+        return result->Error("setShuffleOrder_error", "audioSource argument missing");
+      }
 
       setShuffleOrder(*source);
 
@@ -381,23 +397,36 @@ public:
     } else if (method_call.method_name().compare("concatenatingInsertAll") == 0) {
       const auto* index = std::get_if<int>(ValueOrNull(*args, "index"));
       const auto* children = std::get_if<flutter::EncodableList>(ValueOrNull(*args, "children"));
+      if (index == nullptr || children == nullptr) {
+        return result->Error("concatenatingInsertAll_error", "index or children argument missing");
+      }
 
       auto items = mediaPlaybackList.Items();
 
-      int currentIndex = *index;
-      for (auto& child : *children) {
-        const auto* childMap = std::get_if<flutter::EncodableMap>(&child);
-        auto mediaSource = createMediaPlaybackItem(*childMap);
-        auto item = Playback::MediaPlaybackItem(mediaSource);
-
-        items.InsertAt(currentIndex, item);
-        currentIndex++;
+      try {
+        int currentIndex = *index;
+        for (auto& child : *children) {
+          const auto* childMap = std::get_if<flutter::EncodableMap>(&child);
+          if (childMap == nullptr) {
+            return result->Error("concatenatingInsertAll_error", "invalid child source");
+          }
+          auto item = createMediaPlaybackItem(*childMap);
+          items.InsertAt(currentIndex, item);
+          currentIndex++;
+        }
+      } catch (const winrt::hresult_error& error) {
+        return result->Error("concatenatingInsertAll_error", winrt::to_string(error.message()));
+      } catch (const std::exception& error) {
+        return result->Error("concatenatingInsertAll_error", error.what());
       }
 
       result->Success(flutter::EncodableMap());
     } else if (method_call.method_name().compare("concatenatingRemoveRange") == 0) {
       const auto* start = std::get_if<int>(ValueOrNull(*args, "startIndex"));
       const auto* end = std::get_if<int>(ValueOrNull(*args, "endIndex")); // Does not include this item
+      if (start == nullptr || end == nullptr) {
+        return result->Error("concatenatingRemoveRange_error", "startIndex or endIndex argument missing");
+      }
 
       int startIndex = *start;
       int endIndex = *end;
@@ -419,6 +448,9 @@ public:
     } else if (method_call.method_name().compare("concatenatingMove") == 0) {
       const auto* from = std::get_if<int>(ValueOrNull(*args, "currentIndex"));
       const auto* to = std::get_if<int>(ValueOrNull(*args, "newIndex"));
+      if (from == nullptr || to == nullptr) {
+        return result->Error("concatenatingMove_error", "currentIndex or newIndex argument missing");
+      }
 
       auto items = mediaPlaybackList.Items();
       auto size = (int) items.Size();
@@ -426,12 +458,14 @@ public:
       int currentIndex = *from;
       int newIndex = *to;
 
-      auto item = items.GetAt(currentIndex);
-
-      if (currentIndex >= size || newIndex > size) {
+      // Validate before touching the list: GetAt/RemoveAt/InsertAt all throw
+      // on an out-of-range index. After RemoveAt the list shrinks by one, so a
+      // valid destination is [0, size - 1].
+      if (currentIndex < 0 || currentIndex >= size || newIndex < 0 || newIndex >= size) {
         return result->Error("concatenatingMove_error", "index out of bounds");
       }
 
+      auto item = items.GetAt(currentIndex);
       items.RemoveAt(currentIndex);
       items.InsertAt(newIndex, item);
       // Do nothing if the two equals
@@ -460,12 +494,21 @@ public:
     items.Clear(); // Always clear the list since we are resetting
 
     const std::string* type = std::get_if<std::string>(ValueOrNull(source, "type"));
+    if (type == nullptr) {
+      throw std::invalid_argument("Source is missing a type");
+    }
 
     if (type->compare("concatenating") == 0) {
       const auto* children = std::get_if<flutter::EncodableList>(ValueOrNull(source, "children"));
+      if (children == nullptr) {
+        throw std::invalid_argument("Concatenating source is missing children");
+      }
 
       for (auto& child : *children) {
         const auto* childMap = std::get_if<flutter::EncodableMap>(&child);
+        if (childMap == nullptr) {
+          throw std::invalid_argument("Concatenating child is not a valid source");
+        }
         auto item = createMediaPlaybackItem(*childMap);
         items.Append(item);
       }
@@ -481,22 +524,30 @@ public:
   */
   Playback::MediaPlaybackItem AudioPlayer::createMediaPlaybackItem(const flutter::EncodableMap& source) const& {
     const std::string* type = std::get_if<std::string>(ValueOrNull(source, "type"));
+    if (type == nullptr) {
+      throw std::invalid_argument("Source is missing a type");
+    }
 
     if (type->compare("clipping") == 0) {
       const auto* child = std::get_if<flutter::EncodableMap>(ValueOrNull(source, "child"));
+      if (child == nullptr) {
+        throw std::invalid_argument("Clipping source is missing a child");
+      }
       auto childSource = createMediaSource(*child);
 
-      const auto* startUs = std::get_if<int32_t>(ValueOrNull(*child, "start"));
-      const auto* endUs = std::get_if<int32_t>(ValueOrNull(*child, "end"));
+      // start/end are microseconds and can exceed INT32_MAX (~35 min), so read
+      // them via LongValue() rather than std::get_if<int32_t>.
+      const auto* startValue = ValueOrNull(*child, "start");
+      const auto* endValue = ValueOrNull(*child, "end");
 
-      auto start = 0; // Default to 0
-      if (startUs != nullptr) {
-        start = *startUs;
+      int64_t start = 0; // Default to 0
+      if (startValue != nullptr && !startValue->IsNull()) {
+        start = startValue->LongValue();
       }
 
-      if (endUs != nullptr) {
+      if (endValue != nullptr && !endValue->IsNull()) {
         // We have a duration limit
-        auto duration = *endUs - start;
+        int64_t duration = endValue->LongValue() - start;
 
         return Playback::MediaPlaybackItem(
           childSource,
@@ -519,8 +570,14 @@ public:
   */
   MediaSource AudioPlayer::createMediaSource(const flutter::EncodableMap& source) const {
       const std::string* type = std::get_if<std::string>(ValueOrNull(source, "type"));
+      if (type == nullptr) {
+        throw std::invalid_argument("Source is missing a type");
+      }
       if (type->compare("progressive") == 0 || type->compare("dash") == 0 || type->compare("hls") == 0) {
           const auto* uri = std::get_if<std::string>(ValueOrNull(source, "uri"));
+          if (uri == nullptr) {
+            throw std::invalid_argument("Source is missing a uri");
+          }
           return MediaSource::CreateFromUri(
               Uri(TO_WIDESTRING(EncodeUri(*uri)))
           );
@@ -576,7 +633,7 @@ public:
 
     if (mediaPlaybackList.Items().Size() > 0) {
       int64_t currentIndex = mediaPlaybackList.CurrentItemIndex();
-      if (currentIndex != 4294967295) { // UINT32_MAX - 1
+      if (currentIndex != 4294967295) { // UINT32_MAX: no current item
         eventData[flutter::EncodableValue("currentIndex")] = flutter::EncodableValue(currentIndex); //int
       }
     } else {
@@ -596,7 +653,8 @@ public:
       return 1; //loading
     } else if (state == Playback::MediaPlaybackState::Buffering) {
       return 2;//buffering
-    } else if (session.Position().count() == session.NaturalDuration().count()) {
+    } else if (session.NaturalDuration().count() > 0 &&
+               session.Position().count() >= session.NaturalDuration().count()) {
       return 4; //completed
     }
     return 3; //ready
@@ -675,9 +733,15 @@ public:
   void AudioPlayer::setShuffleOrder(const flutter::EncodableMap& source) {
     const std::string* type = std::get_if<std::string>(ValueOrNull(source, "type"));
     // const std::string* id = std::get_if<std::string>(ValueOrNull(source, "id"));
+    if (type == nullptr) {
+      return;
+    }
 
     if (type->compare("concatenating") == 0) {
       const auto* shuffleOrder = std::get_if<flutter::EncodableList>(ValueOrNull(source, "shuffleOrder"));
+      if (shuffleOrder == nullptr) {
+        return;
+      }
 
       // A copy of mediaPlaybackList.Items()
       std::vector<Playback::MediaPlaybackItem> itemsCopy {};
@@ -685,11 +749,19 @@ public:
         itemsCopy.push_back(item);
       }
 
-      // then we apply the suffling to itemsCopy
-      for (int i = 0; i < ((int) shuffleOrder->size()); i++) {
+      // then we apply the suffling to itemsCopy. Guard every index against the
+      // copy's current size so a mismatched shuffleOrder can't throw out of
+      // this (non-result-returning) method and crash the app.
+      // (Avoid std::min here: <windows.h> defines min() as a macro.)
+      size_t shuffleSize = shuffleOrder->size();
+      int count = (int) (shuffleSize < itemsCopy.size() ? shuffleSize : itemsCopy.size());
+      for (int i = 0; i < count; i++) {
         auto item = itemsCopy.at(i);
 
         auto insertAt = (*shuffleOrder).at(i).LongValue();
+        if (insertAt < 0 || insertAt >= (int64_t) itemsCopy.size()) {
+          continue;
+        }
 
         // delete the item at i
         itemsCopy.erase(itemsCopy.begin() + i);
@@ -703,12 +775,20 @@ public:
       itemsCopy.shrink_to_fit();
 
       const auto* children = std::get_if<flutter::EncodableList>(ValueOrNull(source, "children"));
+      if (children == nullptr) {
+        return;
+      }
       for (auto child : *children) {
-        setShuffleOrder(std::get<flutter::EncodableMap>(child));
+        const auto* childMap = std::get_if<flutter::EncodableMap>(&child);
+        if (childMap != nullptr) {
+          setShuffleOrder(*childMap);
+        }
       }
     } else if (type->compare("looping") == 0) {
       const flutter::EncodableMap* child = std::get_if<flutter::EncodableMap>(ValueOrNull(source, "child"));
-      setShuffleOrder(*child);
+      if (child != nullptr) {
+        setShuffleOrder(*child);
+      }
     } else {
       // can not shuffle a single-audio media source
     }
