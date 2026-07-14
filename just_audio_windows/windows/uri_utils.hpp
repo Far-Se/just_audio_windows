@@ -65,3 +65,85 @@ inline std::string EncodeUri(const std::string& uri) {
 
   return encoded;
 }
+
+inline int HexValue(unsigned char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+// Percent-decodes a string at the byte level (the inverse of EncodeUri).
+// Invalid or truncated "%XX" sequences are left literal.
+inline std::string PercentDecode(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '%' && i + 2 < s.size()) {
+      int hi = HexValue(static_cast<unsigned char>(s[i + 1]));
+      int lo = HexValue(static_cast<unsigned char>(s[i + 2]));
+      if (hi >= 0 && lo >= 0) {
+        out += static_cast<char>((hi << 4) | lo);
+        i += 2;
+        continue;
+      }
+    }
+    out += s[i];
+  }
+  return out;
+}
+
+// Converts a "file://" URI (such as the one produced by Dart's Uri.file()) into
+// a native Windows filesystem path, percent-decoding the UTF-8 bytes. Returns
+// false for any non-file URI (http/https/asset/...), leaving `outPath` untouched.
+//
+// Local files must be opened via StorageFile::GetFileFromPathAsync rather than
+// MediaSource::CreateFromUri: WinRT's Uri canonicalizes the path (decoding
+// bracket and non-ASCII escapes while keeping "%20"), and MediaFoundation's
+// file:// resolver then fails to locate files whose names contain characters
+// like "○", "⧸", "[" or "]" ("The system cannot find the file specified").
+inline bool TryFileUriToWindowsPath(const std::string& uri, std::string& outPath) {
+  const std::string scheme = "file:";
+  if (uri.size() < scheme.size()) return false;
+  for (size_t i = 0; i < scheme.size(); ++i) {
+    if (static_cast<char>(std::tolower(static_cast<unsigned char>(uri[i]))) != scheme[i]) {
+      return false;
+    }
+  }
+
+  size_t pos = scheme.size();  // just past "file:"
+  std::string authority;
+  std::string path;
+  if (uri.compare(pos, 2, "//") == 0) {
+    pos += 2;
+    size_t slash = uri.find('/', pos);
+    if (slash == std::string::npos) {
+      authority = uri.substr(pos);
+    } else {
+      authority = uri.substr(pos, slash - pos);
+      path = uri.substr(slash);  // keeps the leading '/'
+    }
+  } else {
+    // "file:C:/..." (no authority) — rare, but handle it.
+    path = uri.substr(pos);
+  }
+
+  std::string decoded = PercentDecode(path);
+  std::string result;
+  if (!authority.empty()) {
+    // "file://server/share/..." → UNC "\\server\share\...".
+    result = "\\\\" + PercentDecode(authority) + decoded;
+  } else {
+    // "file:///C:/..." → strip the leading '/' before the drive letter.
+    if (!decoded.empty() && decoded[0] == '/') {
+      decoded.erase(0, 1);
+    }
+    result = decoded;
+  }
+
+  for (char& c : result) {
+    if (c == '/') c = '\\';
+  }
+  outPath = result;
+  return true;
+}

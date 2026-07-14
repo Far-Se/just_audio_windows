@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <future>
 #include <stdexcept>
 
 // This must be included before many other Windows headers.
@@ -19,6 +20,7 @@
 #include <winrt/Windows.Media.Audio.h>
 #include <winrt/Windows.Media.Core.h>
 #include <winrt/Windows.Media.Playback.h>
+#include <winrt/Windows.Storage.h>
 #include <winrt/Windows.System.h>
 #define TO_MILLISECONDS(timespan) ((timespan).count() / 10000)
 // A WinRT TimeSpan is measured in 100-nanosecond ticks, so 1 microsecond is
@@ -33,6 +35,7 @@ using namespace winrt::Windows::Foundation;
 using namespace winrt::Windows::Media;
 
 using winrt::Windows::Media::Core::MediaSource;
+using winrt::Windows::Storage::StorageFile;
 
 // Looks for |key| in |map|, returning the associated value if it is present, or
 // a nullptr if not.
@@ -81,6 +84,18 @@ auto TO_WIDESTRING = [](std::string string) -> std::wstring {
   }
   return utf16_string;
 };
+
+// Resolves a StorageFile from a native path synchronously. The plugin runs on
+// Flutter's platform thread, which is an STA (the runner calls CoInitializeEx
+// with COINIT_APARTMENTTHREADED). Calling a WinRT IAsyncOperation's blocking
+// get() directly on an STA thread asserts in debug builds and risks a deadlock,
+// so run the lookup on a dedicated multithreaded-apartment thread and join it.
+inline StorageFile GetFileFromPathSync(const std::wstring& path) {
+  return std::async(std::launch::async, [path] {
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    return StorageFile::GetFileFromPathAsync(path).get();
+  }).get();
+}
 
 
 class JustAudioEventSink {
@@ -578,6 +593,24 @@ public:
           if (uri == nullptr) {
             throw std::invalid_argument("Source is missing a uri");
           }
+
+          // Local files are resolved through StorageFile rather than handed to
+          // MediaSource::CreateFromUri: MediaFoundation's file:// resolver fails
+          // on names containing characters such as "○", "⧸", "[" or "]", even
+          // though the underlying file exists.
+          std::string filePath;
+          if (TryFileUriToWindowsPath(*uri, filePath)) {
+            try {
+              auto storageFile = GetFileFromPathSync(TO_WIDESTRING(filePath));
+              return MediaSource::CreateFromStorageFile(storageFile);
+            } catch (winrt::hresult_error const& ex) {
+              // Fall back to URI-based resolution below (e.g. if the path could
+              // not be resolved for some other reason).
+              std::cerr << "[just_audio_windows] StorageFile resolution failed, "
+                           "falling back to URI: " << winrt::to_string(ex.message()) << std::endl;
+            }
+          }
+
           return MediaSource::CreateFromUri(
               Uri(TO_WIDESTRING(EncodeUri(*uri)))
           );
