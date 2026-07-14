@@ -522,7 +522,7 @@ public:
       if (type->compare("progressive") == 0 || type->compare("dash") == 0 || type->compare("hls") == 0) {
           const auto* uri = std::get_if<std::string>(ValueOrNull(source, "uri"));
           return MediaSource::CreateFromUri(
-              Uri(TO_WIDESTRING(EncodeSpacesInUri(*uri)))
+              Uri(TO_WIDESTRING(EncodeUri(*uri)))
           );
       }
       else {
